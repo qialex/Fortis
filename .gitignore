@@ -1,0 +1,14 @@
+node_modules
+dist
+.turbo
+.env
+.env.*
+!.env.example
+*.js.map
+*.d.ts.map
+.DS_Store
+coverage
+.terraform
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
