@@ -41,13 +41,17 @@ provider "aws" {
 
 # ── DynamoDB ─────────────────────────────────────────────
 
-# Single users table in primary region only
+# Users table as a Global Table — replicated in all 3 regions
+# Reads hit local replica (~5ms). Writes always go to primary
+# via usersWriteRegion in the adapter to prevent duplicate email race conditions.
 resource "aws_dynamodb_table" "users" {
-  provider     = aws.primary
-  name         = "fortis-users"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "PK"
-  range_key    = "SK"
+  provider         = aws.primary
+  name             = "fortis-users"
+  billing_mode     = "PAY_PER_REQUEST"
+  hash_key         = "PK"
+  range_key        = "SK"
+  stream_enabled   = true
+  stream_view_type = "NEW_AND_OLD_IMAGES"  # required for Global Tables
 
   attribute { name = "PK"; type = "S" }
   attribute { name = "SK"; type = "S" }
@@ -62,6 +66,14 @@ resource "aws_dynamodb_table" "users" {
   ttl {
     attribute_name = "expiresAt"
     enabled        = true
+  }
+
+  replica {
+    region_name = "eu-west-2"
+  }
+
+  replica {
+    region_name = "ap-southeast-2"
   }
 
   tags = { Project = "fortis" }

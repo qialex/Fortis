@@ -65,8 +65,8 @@ services:
       PORT: 3001
       USERS_TABLE: fortis-users
       TOKENS_TABLE: fortis-tokens-local
-      PRIMARY_REGION: us-east-1
       AWS_REGION: us-east-1
+      PRIMARY_REGION: us-east-1          # writes to users table always go here
       AWS_ACCESS_KEY_ID: local
       AWS_SECRET_ACCESS_KEY: local
       DYNAMODB_ENDPOINT: http://dynamodb:8000

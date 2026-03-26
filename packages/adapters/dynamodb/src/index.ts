@@ -16,14 +16,27 @@ export interface DynamoDBAdapterConfig {
   tokensTable: string
   emailTokensTable?: string
   region: string
+  // Global Table write routing — all user writes go to primary region
+  // to prevent duplicate email race conditions on concurrent registration.
+  // Reads still hit the local replica for low latency.
+  usersWriteRegion?: string
   endpoint?: string  // for local dev with DynamoDB Local
 }
 
 export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter {
-  const client = new DynamoDBClient({
+  // Read client — local region, hits Global Table replica
+  const readClient = new DynamoDBClient({
     region: config.region,
     ...(config.endpoint ? { endpoint: config.endpoint } : {}),
   })
+
+  // Write client — primary region only, prevents duplicate email on concurrent register
+  const writeClient = config.usersWriteRegion
+    ? new DynamoDBClient({
+        region: config.usersWriteRegion,
+        ...(config.endpoint ? { endpoint: config.endpoint } : {}),
+      })
+    : readClient
 
   const emailTokensTable = config.emailTokensTable ?? `${config.tokensTable}-email`
 
@@ -31,16 +44,18 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
     async createUser(user) {
       const now = Date.now()
       const item = { ...user, createdAt: now, updatedAt: now }
-      await client.send(new PutItemCommand({
+      // Always write to primary region — prevents duplicate email race condition
+      await writeClient.send(new PutItemCommand({
         TableName: config.usersTable,
-        Item: marshall(item),
+        Item: marshall({ PK: `USER#${user.email}`, SK: 'PROFILE', ...item }),
         ConditionExpression: 'attribute_not_exists(PK)',
       }))
       return item as User
     },
 
     async getUserByEmail(email) {
-      const res = await client.send(new GetItemCommand({
+      // Read from local replica — fast
+      const res = await readClient.send(new GetItemCommand({
         TableName: config.usersTable,
         Key: marshall({ PK: `USER#${email}`, SK: 'PROFILE' }),
       }))
@@ -48,7 +63,7 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
     },
 
     async getUserById(userId) {
-      const res = await client.send(new QueryCommand({
+      const res = await readClient.send(new QueryCommand({
         TableName: config.usersTable,
         IndexName: 'userId-index',
         KeyConditionExpression: 'userId = :uid',
@@ -62,7 +77,8 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
       const user = await this.getUserById(userId)
       if (!user) throw new Error('User not found')
       const updated = { ...user, ...data, updatedAt: Date.now() }
-      await client.send(new PutItemCommand({
+      // Writes always go to primary
+      await writeClient.send(new PutItemCommand({
         TableName: config.usersTable,
         Item: marshall({ PK: `USER#${user.email}`, SK: 'PROFILE', ...updated }),
       }))
@@ -72,14 +88,14 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
     async deleteUser(userId) {
       const user = await this.getUserById(userId)
       if (!user) return
-      await client.send(new DeleteItemCommand({
+      await writeClient.send(new DeleteItemCommand({
         TableName: config.usersTable,
         Key: marshall({ PK: `USER#${user.email}`, SK: 'PROFILE' }),
       }))
     },
 
     async listUsers({ limit = 50, cursor } = {}) {
-      const res = await client.send(new ScanCommand({
+      const res = await readClient.send(new ScanCommand({
         TableName: config.usersTable,
         FilterExpression: 'SK = :sk',
         ExpressionAttributeValues: marshall({ ':sk': 'PROFILE' }),
@@ -94,15 +110,16 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
       }
     },
 
+    // Token ops — always local region (regional table, not Global Table)
     async createRefreshToken(token) {
-      await client.send(new PutItemCommand({
+      await readClient.send(new PutItemCommand({
         TableName: config.tokensTable,
         Item: marshall({ PK: `TOKEN#${token.token}`, SK: 'SESSION', ...token }),
       }))
     },
 
     async getRefreshToken(token) {
-      const res = await client.send(new GetItemCommand({
+      const res = await readClient.send(new GetItemCommand({
         TableName: config.tokensTable,
         Key: marshall({ PK: `TOKEN#${token}`, SK: 'SESSION' }),
       }))
@@ -110,7 +127,7 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
     },
 
     async deleteRefreshToken(token) {
-      await client.send(new DeleteItemCommand({
+      await readClient.send(new DeleteItemCommand({
         TableName: config.tokensTable,
         Key: marshall({ PK: `TOKEN#${token}`, SK: 'SESSION' }),
       }))
@@ -122,7 +139,7 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
     },
 
     async listRefreshTokens(userId) {
-      const res = await client.send(new QueryCommand({
+      const res = await readClient.send(new QueryCommand({
         TableName: config.tokensTable,
         IndexName: 'userId-index',
         KeyConditionExpression: 'userId = :uid',
@@ -132,7 +149,7 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
     },
 
     async createEmailToken({ token, userId, email, type, expiresAt }) {
-      await client.send(new PutItemCommand({
+      await writeClient.send(new PutItemCommand({
         TableName: emailTokensTable,
         Item: marshall({
           PK: `EMAIL_TOKEN#${token}`,
@@ -143,7 +160,7 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
     },
 
     async getEmailToken(token, type) {
-      const res = await client.send(new GetItemCommand({
+      const res = await readClient.send(new GetItemCommand({
         TableName: emailTokensTable,
         Key: marshall({ PK: `EMAIL_TOKEN#${token}`, SK: type.toUpperCase() }),
       }))
@@ -153,14 +170,14 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
     },
 
     async deleteEmailToken(token) {
-      await client.send(new DeleteItemCommand({
+      await writeClient.send(new DeleteItemCommand({
         TableName: emailTokensTable,
         Key: marshall({ PK: `EMAIL_TOKEN#${token}`, SK: 'VERIFY' }),
       }))
     },
 
     async incrementLoginAttempts(key) {
-      const res = await client.send(new UpdateItemCommand({
+      const res = await readClient.send(new UpdateItemCommand({
         TableName: config.tokensTable,
         Key: marshall({ PK: `RL#${key}`, SK: 'ATTEMPTS' }),
         UpdateExpression: 'ADD attempts :inc SET expiresAt = if_not_exists(expiresAt, :exp)',
@@ -174,7 +191,7 @@ export function dynamodbAdapter(config: DynamoDBAdapterConfig): DatabaseAdapter 
     },
 
     async resetLoginAttempts(key) {
-      await client.send(new DeleteItemCommand({
+      await readClient.send(new DeleteItemCommand({
         TableName: config.tokensTable,
         Key: marshall({ PK: `RL#${key}`, SK: 'ATTEMPTS' }),
       }))

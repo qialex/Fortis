@@ -20,9 +20,9 @@ export async function init(options: InitOptions) {
   console.log(`Primary region:  ${primaryRegion}`)
   console.log(`All regions:     ${regions.join(', ')}\n`)
 
-  // Create users table in primary region
-  console.log(`Creating users table in ${primaryRegion}...`)
-  await createTable(primaryRegion, 'fortis-users')
+  // Create users table as Global Table in primary region with replicas
+  console.log(`Creating users Global Table in ${primaryRegion} with replicas in ${regions.filter(r => r !== primaryRegion).join(', ')}...`)
+  await createUsersGlobalTable(primaryRegion, regions)
 
   // Create regional token tables
   for (const region of regions) {
@@ -55,7 +55,48 @@ export async function init(options: InitOptions) {
   console.log('  3. Deploy Lambdas: cd infra/terraform/aws && terraform apply\n')
 }
 
-async function createTable(region: string, tableName: string) {
+async function createUsersGlobalTable(primaryRegion: string, allRegions: string[]) {
+  const client = new DynamoDBClient({ region: primaryRegion })
+  const tableName = 'fortis-users'
+  const replicaRegions = allRegions.filter(r => r !== primaryRegion)
+
+  try {
+    await client.send(new DescribeTableCommand({ TableName: tableName }))
+    console.log(`  ⚠ ${tableName} already exists — skipping`)
+    return
+  } catch {}
+
+  await client.send(new CreateTableCommand({
+    TableName: tableName,
+    BillingMode: 'PAY_PER_REQUEST',
+    StreamSpecification: {
+      StreamEnabled: true,
+      StreamViewType: 'NEW_AND_OLD_IMAGES',  // required for Global Tables
+    },
+    AttributeDefinitions: [
+      { AttributeName: 'PK', AttributeType: 'S' },
+      { AttributeName: 'SK', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'PK', KeyType: 'HASH' },
+      { AttributeName: 'SK', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [{
+      IndexName: 'userId-index',
+      KeySchema: [{ AttributeName: 'userId', KeyType: 'HASH' }],
+      Projection: { ProjectionType: 'ALL' },
+    }],
+    ReplicaUpdates: replicaRegions.map(r => ({
+      Create: { RegionName: r },
+    })),
+  }))
+
+  console.log(`  ✓ ${tableName} created as Global Table`)
+  console.log(`  ✓ Replicas added: ${replicaRegions.join(', ')}`)
+}
+
+
   const client = new DynamoDBClient({ region })
 
   try {

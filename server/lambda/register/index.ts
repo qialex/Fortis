@@ -15,7 +15,10 @@ const fortis = createFortis({
   db: dynamodbAdapter({
     usersTable: process.env.USERS_TABLE!,
     tokensTable: process.env.TOKENS_TABLE!,
-    region: process.env.PRIMARY_REGION ?? 'us-east-1',
+    // Reads from local Global Table replica — fast
+    region: process.env.AWS_REGION!,
+    // Writes always go to primary to prevent duplicate email on concurrent register
+    usersWriteRegion: process.env.PRIMARY_REGION ?? 'us-east-1',
   }),
   email: sesAdapter({ region: process.env.PRIMARY_REGION ?? 'us-east-1' }),
   jwt: {

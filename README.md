@@ -56,33 +56,34 @@ ap-southeast-2   eu-west-2       us-east-1
   ▼                ▼                ▼
 API GATEWAY      API GATEWAY     API GATEWAY
   │                │                │
-  ├─ /register ────┼────────────────┼──► us-east-1 Lambda
-  │                │                │    └─► fortis-users (DynamoDB)
-  │                │                │        [single table, primary region]
-  │                │                │
-  ├─ /login ───────┼────────────────┼──► us-east-1 Lambda
-  │                │                │    └─► fortis-users (DynamoDB)
-  │                │                │        └─► writes token to LOCAL table
-  │                │                │
+  ├─ /register     │                │
+  │  └─► LOCAL Lambda               │
+  │       └─► fortis-users-au ──────┼──────────────────────┐
+  │           [Global Table replica]│  auto-replicates ~1s  │
+  │                                 │                       │
+  ├─ /login        │                │                       │
+  │  └─► LOCAL Lambda               │                       │
+  │       └─► fortis-users-au       │  fortis-users-uk  fortis-users-us
+  │           [local read, ~5ms]    │  [replica]        [replica]
+  │                                 │
   ├─ /token/refresh│                │
   │  └─► LOCAL Lambda               │
-  │       └─► fortis-tokens-au      │    fortis-tokens-uk    fortis-tokens-us
-  │           [regional DynamoDB]   │    [regional DynamoDB] [regional DynamoDB]
-  │           ~5ms read             │
-  │                │                │
+  │       └─► fortis-tokens-au      │   fortis-tokens-uk   fortis-tokens-us
+  │           [regional, ~5ms]      │   [regional]         [regional]
+  │                                 │
   ├─ /logout       │                │
   │  └─► LOCAL Lambda               │
   │       └─► delete from LOCAL tokens table
-  │                │                │
+  │                                 │
   └─ /logout-all   │                │
      └─► LOCAL Lambda
-          └─► parallel writes to ALL 3 regional token tables (fan-out)
+          └─► parallel deletes across ALL 3 regional token tables
 ```
 
 ### Data layer
 
 ```
-fortis-users (us-east-1 only)
+fortis-users  (DynamoDB Global Table — replicated in all 3 regions)
 ┌─────────────────────────────────────────────────────────┐
 │ PK                    SK          Attributes             │
 │ USER#email@x.com      PROFILE     userId, passwordHash  │
@@ -90,27 +91,43 @@ fortis-users (us-east-1 only)
 │ EMAIL_TOKEN#<token>   RESET       userId, expiresAt     │
 │ RL#login:ip           ATTEMPTS    count, expiresAt      │
 └─────────────────────────────────────────────────────────┘
-                  GSI: userId-index
+  GSI: userId-index
+  Replicas: us-east-1 · eu-west-2 · ap-southeast-2
+  Replication lag: ~1–2s (eventual consistency)
+  Write routing: ALL writes go to PRIMARY region (us-east-1)
+                 to prevent duplicate email on concurrent register
 
-fortis-tokens-{au|uk|us}  (one per region)
+fortis-tokens-{au|uk|us}  (one regional table per region, NOT replicated)
 ┌─────────────────────────────────────────────────────────┐
 │ PK                    SK          Attributes             │
 │ TOKEN#<token>         SESSION     userId, sessionId,    │
 │                                   expiresAt, ip, ua     │
 └─────────────────────────────────────────────────────────┘
-                  GSI: userId-index
-                  TTL: expiresAt (auto-delete)
+  GSI: userId-index
+  TTL: expiresAt (auto-delete)
 ```
 
 ### Request latency
 
 | Operation | Hops | Latency |
 |-----------|------|---------|
-| Register | local → us-east-1 (cross-region) | 300–500ms — once |
-| Login | local → us-east-1 (cross-region) | 200–350ms — once |
-| Token refresh | local → local DynamoDB | 5–20ms — frequent |
+| Register | local Lambda → primary region write | 20–50ms — once |
+| Login | local Lambda → local Global Table replica | 5–20ms — once |
+| Token refresh | local Lambda → local tokens table | 5–20ms — frequent |
 | JWT validation | CloudFront Function (edge) | <1ms — never hits Lambda |
-| Logout | local → local DynamoDB | 5–20ms |
+| Logout | local Lambda → local tokens table | 5–20ms |
+
+### Cost at 1M MAU
+
+| Component | Cost/month |
+|-----------|-----------|
+| DynamoDB users (Global Table, 3 regions) | ~$15 |
+| DynamoDB tokens (3 regional tables) | ~$8 |
+| Lambda (3 regions) | ~$22 |
+| API Gateway | ~$20 |
+| Route 53 | ~$5 |
+| WAF + CloudWatch + Secrets | ~$26 |
+| **Total** | **~$96/month** |
 
 ---
 
@@ -119,9 +136,11 @@ fortis-tokens-{au|uk|us}  (one per region)
 | MAU | Fortis (AWS) | Clerk | Auth0 |
 |-----|-------------|-------|-------|
 | 10k | ~$5 | Free | Free |
-| 100k | ~$20 | ~$1,800 | ~$850 |
-| 500k | ~$70 | ~$9,800 | ~$3,500 |
-| 1M | ~$120 | ~$19,020 | ~$7,000+ |
+| 100k | ~$25 | ~$1,800 | ~$850 |
+| 500k | ~$75 | ~$9,800 | ~$3,500 |
+| 1M | ~$106 | ~$19,020 | ~$7,000+ |
+
+Fortis uses DynamoDB Global Tables for the users table (replicated across all 3 regions) and regional token tables per region. Full breakdown in the architecture section above.
 
 ---
 
