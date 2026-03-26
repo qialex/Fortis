@@ -44,15 +44,73 @@ docker compose up
 ## Architecture
 
 ```
-User (Sydney)  →  Route 53 (latency routing)  →  ap-southeast-2 Lambda
-                                                    ├── login    → users table (us-east-1)
-                                                    ├── refresh  → tokens-au (local, ~5ms)
-                                                    └── register → users table (us-east-1)
+USERS (global)
+  │
+  ▼
+ROUTE 53 — latency-based routing
+  │                │                │
+  ▼                ▼                ▼
+ap-southeast-2   eu-west-2       us-east-1
+(Australia)        (UK)             (US)
+  │                │                │
+  ▼                ▼                ▼
+API GATEWAY      API GATEWAY     API GATEWAY
+  │                │                │
+  ├─ /register ────┼────────────────┼──► us-east-1 Lambda
+  │                │                │    └─► fortis-users (DynamoDB)
+  │                │                │        [single table, primary region]
+  │                │                │
+  ├─ /login ───────┼────────────────┼──► us-east-1 Lambda
+  │                │                │    └─► fortis-users (DynamoDB)
+  │                │                │        └─► writes token to LOCAL table
+  │                │                │
+  ├─ /token/refresh│                │
+  │  └─► LOCAL Lambda               │
+  │       └─► fortis-tokens-au      │    fortis-tokens-uk    fortis-tokens-us
+  │           [regional DynamoDB]   │    [regional DynamoDB] [regional DynamoDB]
+  │           ~5ms read             │
+  │                │                │
+  ├─ /logout       │                │
+  │  └─► LOCAL Lambda               │
+  │       └─► delete from LOCAL tokens table
+  │                │                │
+  └─ /logout-all   │                │
+     └─► LOCAL Lambda
+          └─► parallel writes to ALL 3 regional token tables (fan-out)
 ```
 
-- **Single users table** in primary region (us-east-1) — consistent registration, no duplicates
-- **Regional token tables** per region — sub-10ms token refresh everywhere
-- **CloudFront Functions** for JWT validation — never hits Lambda for read-only auth checks
+### Data layer
+
+```
+fortis-users (us-east-1 only)
+┌─────────────────────────────────────────────────────────┐
+│ PK                    SK          Attributes             │
+│ USER#email@x.com      PROFILE     userId, passwordHash  │
+│ EMAIL_TOKEN#<token>   VERIFY      userId, expiresAt     │
+│ EMAIL_TOKEN#<token>   RESET       userId, expiresAt     │
+│ RL#login:ip           ATTEMPTS    count, expiresAt      │
+└─────────────────────────────────────────────────────────┘
+                  GSI: userId-index
+
+fortis-tokens-{au|uk|us}  (one per region)
+┌─────────────────────────────────────────────────────────┐
+│ PK                    SK          Attributes             │
+│ TOKEN#<token>         SESSION     userId, sessionId,    │
+│                                   expiresAt, ip, ua     │
+└─────────────────────────────────────────────────────────┘
+                  GSI: userId-index
+                  TTL: expiresAt (auto-delete)
+```
+
+### Request latency
+
+| Operation | Hops | Latency |
+|-----------|------|---------|
+| Register | local → us-east-1 (cross-region) | 300–500ms — once |
+| Login | local → us-east-1 (cross-region) | 200–350ms — once |
+| Token refresh | local → local DynamoDB | 5–20ms — frequent |
+| JWT validation | CloudFront Function (edge) | <1ms — never hits Lambda |
+| Logout | local → local DynamoDB | 5–20ms |
 
 ---
 
