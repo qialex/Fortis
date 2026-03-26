@@ -50,8 +50,15 @@ USERS (global)
 ROUTE 53 — latency-based routing
   │                │                │
   ▼                ▼                ▼
-ap-southeast-2   eu-west-2       us-east-1
-(Australia)        (UK)             (US)
+CLOUDFRONT       CLOUDFRONT       CLOUDFRONT
+(ap-southeast-2) (eu-west-2)      (us-east-1)
+  │                │                │
+  ├─ JWT valid? ───┤                │
+  │  └─► CloudFront Function (edge) │
+  │       verify signature <1ms     │
+  │       no Lambda, no DynamoDB    │
+  │       ► 401 if invalid          │
+  │       ► pass-through if valid   │
   │                │                │
   ▼                ▼                ▼
 API GATEWAY      API GATEWAY     API GATEWAY
@@ -79,6 +86,25 @@ API GATEWAY      API GATEWAY     API GATEWAY
      └─► LOCAL Lambda
           └─► parallel deletes across ALL 3 regional token tables
 ```
+
+> **CloudFront role:** JWT validation runs as a CloudFront Function at the edge — no Lambda invocation, no DynamoDB read. Invalid tokens are rejected before they ever reach your API Gateway. This is the hottest path in any auth system and costs ~$0.10/1M requests.
+
+### What's not included yet
+
+The following are planned but not implemented in v0.1. PRs welcome.
+
+| Missing | Notes |
+|---------|-------|
+| MFA / TOTP | Google Authenticator style 2FA |
+| Social login | OAuth2 — Google, GitHub, Apple |
+| Magic link login | Passwordless email login |
+| Passkeys / WebAuthn | FIDO2 hardware key support |
+| Organizations / RBAC | Multi-tenant team management |
+| Pre-built UI components | React login/register forms |
+| Session list Lambda | List active devices per user |
+| Admin UI dashboard | Web UI for user management |
+| Audit logs | Who did what and when |
+| SCIM provisioning | Enterprise directory sync |
 
 ### Data layer
 
@@ -125,9 +151,10 @@ fortis-tokens-{au|uk|us}  (one regional table per region, NOT replicated)
 | DynamoDB tokens (3 regional tables) | ~$8 |
 | Lambda (3 regions) | ~$22 |
 | API Gateway | ~$20 |
+| CloudFront + CloudFront Functions | ~$5 |
 | Route 53 | ~$5 |
 | WAF + CloudWatch + Secrets | ~$26 |
-| **Total** | **~$96/month** |
+| **Total** | **~$101/month** |
 
 ---
 
@@ -138,9 +165,9 @@ fortis-tokens-{au|uk|us}  (one regional table per region, NOT replicated)
 | 10k | ~$5 | Free | Free |
 | 100k | ~$25 | ~$1,800 | ~$850 |
 | 500k | ~$75 | ~$9,800 | ~$3,500 |
-| 1M | ~$106 | ~$19,020 | ~$7,000+ |
+| 1M | ~$101 | ~$19,020 | ~$7,000+ |
 
-Fortis uses DynamoDB Global Tables for the users table (replicated across all 3 regions) and regional token tables per region. Full breakdown in the architecture section above.
+Fortis uses DynamoDB Global Tables for the users table (replicated across all 3 regions), regional token tables per region, and CloudFront Functions for edge JWT validation. Full breakdown in the architecture section above.
 
 ---
 
@@ -251,6 +278,16 @@ const fortis = createFortis({
 | Resend | `@fortis/adapter-resend` |
 | Sendgrid | `@fortis/adapter-sendgrid` |
 | Postmark | `@fortis/adapter-postmark` |
+
+> **Email cost is not included in Fortis cost estimates** and varies significantly by provider and auth strategy. At 1M MAU, email volume depends entirely on your flows:
+>
+> | Scenario | Emails/month | SES cost | Resend cost |
+> |----------|-------------|----------|-------------|
+> | Email verify only (10% new users) | ~100k | ~$10 | ~$90 |
+> | Verify + password reset (5% MAU) | ~150k | ~$15 | ~$135 |
+> | Magic link login (every login) | ~5M+ | ~$500 | ~$4,500+ |
+>
+> Magic link or OTP-per-login strategies can make email your dominant cost — more than all other infrastructure combined. Choose your auth strategy with email cost in mind. SES is cheapest at scale ($0.10/1k). Resend and Postmark are more expensive but have better deliverability tooling out of the box.
 
 ---
 
